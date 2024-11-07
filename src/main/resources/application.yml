@@ -1,12 +1,14 @@
 server:
   port: 8090
+  maxHttpHeaderSize: 8192
 
 spring:
   cloud:
     gateway:
       routes:
         - id: api_route
-          uri: http://localhost:8123
+          uri: http://10.15.25.23:8123
+#          uri: http://localhost:8123
           predicates:
             - Path=/api/**
 
@@ -17,6 +19,12 @@ dubbo:
     name: dubbo
     port: -1
   registry:
-    address: zookeeper://10.15.25.23:2181
+#    address: zookeeper://10.15.25.23:2181
+    address: redis://10.15.25.23:6379
   config-center:
     timeout: 10000
+  consumer:
+    # 设置重试次数
+    retries: 3
+    # 设置超时时间（毫秒）
+    timeout: 5000

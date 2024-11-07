@@ -1,8 +1,10 @@
 package com.swx.sapigateway;
 
 import com.swx.sapiclientsdk.utils.SignUtils;
+import com.swx.sapicommon.model.entity.InterfaceCallLog;
 import com.swx.sapicommon.model.entity.InterfaceInfo;
 import com.swx.sapicommon.model.entity.User;
+import com.swx.sapicommon.service.InnerInterfaceCallLogService;
 import com.swx.sapicommon.service.InnerInterfaceInfoService;
 import com.swx.sapicommon.service.InnerUserInterfaceInfoService;
 import com.swx.sapicommon.service.InnerUserService;
@@ -16,7 +18,6 @@ import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
@@ -26,7 +27,9 @@ import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -41,10 +44,13 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
     private InnerInterfaceInfoService innerInterfaceInfoService;
     @DubboReference
     private InnerUserInterfaceInfoService innerUserInterfaceInfoService;
+    @DubboReference
+    private InnerInterfaceCallLogService innerInterfaceCallLogService;
 
 
     private static final List<String> IP_WHITE_LIST = Arrays.asList("127.0.0.1");
 
+//    private static final String INTERFACE_HOST = "http://120.79.135.199:29176/gateway";
     private static final String INTERFACE_HOST = "http://localhost:8090";
 
     @Override
@@ -101,7 +107,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return handleNoAuth(response);
         }
         //4.请求的模拟接口是否合法
-        //todo 从数据库中查询模拟接口是否存在 以及请求方法是否匹配
+        // 从数据库中查询模拟接口是否存在 以及请求方法是否匹配
         InterfaceInfo interfaceInfo = null;
         try {
             interfaceInfo = innerInterfaceInfoService.getInterfaceInfo(path, method);
@@ -112,21 +118,72 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
             return handleNoAuth(response);
         }
 
-        //5.调用模拟接口（请求转发）
-//        Mono<Void> filter = chain.filter(exchange);
-        //6.响应日志
-
-        //查询是否是新用户第一次调用 如果是 则增加记录 默认提供50次该接口调用额度 不是则判断是否有调用次数
+//        转发请求
+//        查询是否是新用户第一次调用 如果是 则增加记录 默认提供50次该接口调用额度 不是则判断是否有调用次数
         boolean isEmptyForUserInfaceInfo = innerUserInterfaceInfoService.isEmptyForUserInfaceInfo(interfaceInfo.getId(), invokeUser.getId());
         if (isEmptyForUserInfaceInfo) {
-            return handleResponse(exchange, chain, interfaceInfo.getId(), invokeUser.getId());
+//return handleResponse(exchange, chain, interfaceInfo.getId(), invokeUser.getId());
+            String realityUrl = interfaceInfo.getRealityUrl();
+            if (realityUrl != null && !realityUrl.isEmpty()) {
+                try {
+                    // 动态设置新的转发 URI
+                    URI newUri = URI.create(realityUrl);
+                    // 修改请求的 URI，转发到 interfacePath
+                    ServerHttpRequest modifiedRequest = request.mutate().uri(newUri).build();
+                    ServerWebExchange modifiedExchange = exchange.mutate().request(modifiedRequest).build();
+                    // 将修改后的请求继续交给下一个过滤器处理
+//                    return chain.filter(modifiedExchange);
+                    InterfaceInfo finalInterfaceInfo = interfaceInfo;
+                    User finalInvokeUser = invokeUser;
+                    //增加调用记录
+                    InterfaceCallLog interfaceCallLog = new InterfaceCallLog();
+                    interfaceCallLog.setUserId(invokeUser.getId());
+                    interfaceCallLog.setInterfaceInfoId(finalInterfaceInfo.getId());
+                    interfaceCallLog.setCallTime(LocalDateTime.now());
+                    interfaceCallLog.setCallIp(sourceAddress);
+                    return chain.filter(modifiedExchange).then(Mono.defer(() -> {
+                        // 获取响应状态码，判断是否成功
+                        HttpStatus statusCode = response.getStatusCode();
+                        if (statusCode != null && statusCode.is2xxSuccessful()) {
+                            // 5. 如果响应成功，增加调用次数
+                            try {
+//                                innerInterfaceInfoService.incrementInvokeCount(interfaceInfo.getId());
+                                innerUserInterfaceInfoService.invokeCount(finalInterfaceInfo.getId(), finalInvokeUser.getId());
+                                log.info("调用次数已增加 for interfaceId: " + finalInterfaceInfo.getId());
+                            } catch (Exception e) {
+                                log.error("incrementInvokeCount error", e);
+                            }
+                            //插入调用记录
+                            interfaceCallLog.setStatus(0);
+                            innerInterfaceCallLogService.insertInterfaceCallLog(interfaceCallLog);
+
+                        } else {
+                            log.warn("接口调用失败, 状态码: " + statusCode);
+                            //插入调用记录
+                            interfaceCallLog.setStatus(1);
+                            interfaceCallLog.setErrorMessage(String.valueOf(statusCode));
+                            innerInterfaceCallLogService.insertInterfaceCallLog(interfaceCallLog);
+                        }
+                        return Mono.empty();
+                    }));
+
+
+                } catch (Exception e) {
+                    // 处理 URI 解析错误
+                    return Mono.error(new IllegalArgumentException("Invalid interfacePath: " + realityUrl));
+                }
+            }
         }else {
             return handleNoAuth(response);
         }
 
+        // 如果没有找到 interfacePath 头，继续正常的请求处理
+        return chain.filter(exchange);
         //7.todo 调用成功 调用次数加一 invokeCount
 
-    }
+
+
+       }
 
 
     /**
@@ -158,7 +215,11 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                                     fluxBody.map(dataBuffer -> {
                                         // 7. 调用成功，接口调用次数 + 1 invokeCount
                                         try {
+                                            //记录调用
+                                            //调用次数+1
                                             innerUserInterfaceInfoService.invokeCount(interfaceInfoId, userId);
+                                            //增加调用记录
+
                                         } catch (Exception e) {
                                             log.error("invokeCount error", e);
                                         }
@@ -176,7 +237,7 @@ public class CustomGlobalFilter implements GlobalFilter, Ordered {
                                         return bufferFactory.wrap(content);
                                     }));
                         } else {
-                            // 8. 调用失败，返回一个规范的错误码
+                            // 8. 调用失败，返回一个规范的错误码 增加调用记录 status = 1
                             log.error("<--- {} 响应code异常", getStatusCode());
                         }
                         return super.writeWith(body);
